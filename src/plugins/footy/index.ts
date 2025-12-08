@@ -10,9 +10,12 @@ import {
     type State,
     logger,
 } from '@elizaos/core';
+import { FootballApiService } from './services/football-api.ts';
 
-// --- MOCK DATA ---
+// --- SERVICE INSTANCE ---
+const apiService = new FootballApiService();
 
+// --- MOCK DATA (Fallback) ---
 const MOCK_FIXTURES = [
     { id: 1, home: 'Arsenal', away: 'Tottenham', date: '2025-12-06T12:30:00Z', competition: 'Premier League' },
     { id: 2, home: 'Liverpool', away: 'Man City', date: '2025-12-06T15:00:00Z', competition: 'Premier League' },
@@ -28,6 +31,7 @@ const MOCK_FPL_ADVICE = [
 // --- PROVIDER ---
 
 const footballDataProvider: Provider = {
+    name: 'football_data_provider',
     get: async (_runtime: IAgentRuntime, _message: Memory, _state?: State) => {
         return {
             text: `Current Football Context:
@@ -52,9 +56,24 @@ const getFixturesAction: Action = {
         _options: any,
         callback: HandlerCallback
     ): Promise<ActionResult> => {
-        const fixturesText = MOCK_FIXTURES.map(
-            (f) => `- ${f.home} vs ${f.away} (${f.competition}) on ${new Date(f.date).toDateString()}`
-        ).join('\n');
+        let fixturesText = '';
+
+        try {
+            // Try fetching live data
+            const fixtures = await apiService.getUpcomingFixtures();
+            if (fixtures.length > 0) {
+                fixturesText = fixtures.map(
+                    (f) => `- ${f.homeTeam.name} vs ${f.awayTeam.name} (${f.league}) on ${new Date(f.date).toDateString()}`
+                ).join('\n');
+            } else {
+                throw new Error("No fixtures found");
+            }
+        } catch (e) {
+            logger.warn("Failed to fetch live fixtures, using mock data.", e);
+            fixturesText = MOCK_FIXTURES.map(
+                (f) => `- ${f.home} vs ${f.away} (${f.competition}) on ${new Date(f.date).toDateString()} (MOCK DATA)`
+            ).join('\n');
+        }
 
         const response: Content = {
             text: `Here are the upcoming fixtures:\n${fixturesText}`,
@@ -66,8 +85,8 @@ const getFixturesAction: Action = {
     },
     examples: [
         [
-            { user: '{{user1}}', content: { text: 'What games are on this weekend?' } },
-            { user: '{{agentName}}', content: { text: 'Here are the upcoming fixtures...', actions: ['GET_FIXTURES'] } },
+            { name: '{{name1}}', content: { text: 'What games are on this weekend?' } },
+            { name: '{{name2}}', content: { text: 'Here are the upcoming fixtures...', actions: ['GET_FIXTURES'] } },
         ],
     ],
 };
@@ -84,6 +103,7 @@ const getFantasyAdviceAction: Action = {
         _options: any,
         callback: HandlerCallback
     ): Promise<ActionResult> => {
+        // FPL API usually requires authentication or complex scraping, so keeping mock for now
         const adviceText = MOCK_FPL_ADVICE.map(
             (a) => `- **${a.player}** (${a.team}): ${a.recommendation}. ${a.reason}`
         ).join('\n');
@@ -98,8 +118,8 @@ const getFantasyAdviceAction: Action = {
     },
     examples: [
         [
-            { user: '{{user1}}', content: { text: 'Who should I captain?' } },
-            { user: '{{agentName}}', content: { text: 'Here is my FPL advice...', actions: ['GET_FANTASY_ADVICE'] } },
+            { name: '{{name1}}', content: { text: 'Who should I captain?' } },
+            { name: '{{name2}}', content: { text: 'Here is my FPL advice...', actions: ['GET_FANTASY_ADVICE'] } },
         ],
     ],
 };
@@ -117,15 +137,15 @@ const predictMatchAction: Action = {
         callback: HandlerCallback
     ): Promise<ActionResult> => {
         // Simple logic to pick a winner based on the message content (mock AI)
-        const content = message.content.text.toLowerCase();
+        const content = (message.content.text || '').toLowerCase();
         let prediction = "It's too close to call!";
-        
+
         if (content.includes('arsenal') && content.includes('tottenham')) {
             prediction = "I'm backing **Arsenal** to win 2-1. They have the home advantage and better form.";
         } else if (content.includes('liverpool') && content.includes('city')) {
             prediction = "This is a titan clash. I predict a **2-2 Draw**. Both attacks are too strong.";
         } else {
-             prediction = "I'd need to see the lineups first, but I generally favor the home team in these clashes.";
+            prediction = "I'd need to see the lineups first, but I generally favor the home team in these clashes.";
         }
 
         const response: Content = {
@@ -138,8 +158,8 @@ const predictMatchAction: Action = {
     },
     examples: [
         [
-            { user: '{{user1}}', content: { text: 'Who wins Arsenal vs Spurs?' } },
-            { user: '{{agentName}}', content: { text: 'I predict Arsenal...', actions: ['PREDICT_MATCH'] } },
+            { name: '{{name1}}', content: { text: 'Who wins Arsenal vs Spurs?' } },
+            { name: '{{name2}}', content: { text: 'I predict Arsenal...', actions: ['PREDICT_MATCH'] } },
         ],
     ],
 };
