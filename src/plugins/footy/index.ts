@@ -10,7 +10,7 @@ import {
     type State,
     logger,
 } from '@elizaos/core';
-import { FootballApiService } from './services/football-api.ts';
+import { FootballApiService, leagues } from './services/football-api.ts';
 
 // --- SERVICE INSTANCE ---
 const apiService = new FootballApiService();
@@ -46,27 +46,78 @@ const footballDataProvider: Provider = {
 
 const getFixturesAction: Action = {
     name: 'GET_FIXTURES',
-    similes: ['SHOW_MATCHES', 'UPCOMING_GAMES', 'SCHEDULE'],
-    description: 'Retrieves the list of upcoming football matches.',
+    similes: ['SHOW_MATCHES', 'UPCOMING_GAMES', 'SCHEDULE', 'ALL_FIXTURES'],
+    description: 'Retrieves the list of upcoming football matches. Can fetch for specific leagues or all major leagues.',
     validate: async (_runtime: IAgentRuntime, _message: Memory) => true,
     handler: async (
         _runtime: IAgentRuntime,
-        _message: Memory,
+        message: Memory,
         _state: State,
         _options: any,
         callback: HandlerCallback
     ): Promise<ActionResult> => {
         let fixturesText = '';
+        const content = (message.content.text || '').toLowerCase();
+
+        // 1. Detect League
+        let targetLeagues: string[] = [];
+
+        // Check for specific league mentions
+        if (content.includes('premier league') || content.includes('epl') || content.includes('english')) {
+            targetLeagues.push('epl');
+        }
+        if (content.includes('la liga') || content.includes('spanish')) {
+            targetLeagues.push('laliga');
+        }
+        if (content.includes('bundesliga') || content.includes('german')) {
+            targetLeagues.push('bund');
+        }
+        if (content.includes('serie a') || content.includes('italian')) {
+            // Note: Serie A is not in our current leagues list in football-api.ts, need to check if supported or add it.
+            // For now, let's stick to what we have.
+            // targetLeagues.push('seriea'); 
+        }
+        if (content.includes('champions league') || content.includes('ucl')) {
+            targetLeagues.push('ucl');
+        }
+        if (content.includes('mls') || content.includes('major league soccer')) {
+            targetLeagues.push('mls');
+        }
+
+        // If "all" is requested or no specific league found, fetch top leagues
+        if (content.includes('all') || targetLeagues.length === 0) {
+            // Default to top leagues if no specific one is asked for
+            targetLeagues = ['epl', 'laliga', 'bund', 'ucl', 'mls'];
+        }
 
         try {
-            // Try fetching live data
-            const fixtures = await apiService.getUpcomingFixtures();
-            if (fixtures.length > 0) {
-                fixturesText = fixtures.map(
-                    (f) => `- ${f.homeTeam.name} vs ${f.awayTeam.name} (${f.league}) on ${new Date(f.date).toDateString()}`
-                ).join('\n');
+            const allFixtures = [];
+
+            for (const leagueId of targetLeagues) {
+                const fixtures = await apiService.getUpcomingFixtures(leagueId);
+                if (fixtures.length > 0) {
+                    allFixtures.push(...fixtures);
+                }
+            }
+
+            if (allFixtures.length > 0) {
+                // Group by league for better readability
+                const grouped = allFixtures.reduce((acc, f) => {
+                    if (!acc[f.league]) acc[f.league] = [];
+                    acc[f.league].push(f);
+                    return acc;
+                }, {} as Record<string, typeof allFixtures>);
+
+                fixturesText = Object.entries(grouped).map(([leagueName, fixtures]) => {
+                    const leagueHeader = `\n**${leagueName}**\n`;
+                    const matches = fixtures.map(
+                        (f) => `- ${f.homeTeam.name} vs ${f.awayTeam.name} on ${new Date(f.date).toDateString()} (${f.status.short})`
+                    ).join('\n');
+                    return leagueHeader + matches;
+                }).join('\n');
+
             } else {
-                throw new Error("No fixtures found");
+                fixturesText = "No upcoming fixtures found for the requested leagues.";
             }
         } catch (e) {
             logger.warn("Failed to fetch live fixtures, using mock data.", e);
@@ -88,6 +139,14 @@ const getFixturesAction: Action = {
             { name: '{{name1}}', content: { text: 'What games are on this weekend?' } },
             { name: '{{name2}}', content: { text: 'Here are the upcoming fixtures...', actions: ['GET_FIXTURES'] } },
         ],
+        [
+            { name: '{{name1}}', content: { text: 'Show me La Liga matches' } },
+            { name: '{{name2}}', content: { text: 'Here are the upcoming La Liga fixtures...', actions: ['GET_FIXTURES'] } },
+        ],
+        [
+            { name: '{{name1}}', content: { text: 'Get all fixtures' } },
+            { name: '{{name2}}', content: { text: 'Here are fixtures for EPL, La Liga, and others...', actions: ['GET_FIXTURES'] } },
+        ]
     ],
 };
 

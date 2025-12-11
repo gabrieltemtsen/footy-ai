@@ -1,6 +1,7 @@
 import { logger, type IAgentRuntime, type Project, type ProjectAgent } from '@elizaos/core';
 import starterPlugin from './plugin.ts';
 import footyPlugin from './plugins/footy/index.ts';
+import farcasterPlugin from '@elizaos/plugin-farcaster';
 import { character } from './character.ts';
 
 const initCharacter = ({ runtime }: { runtime: IAgentRuntime }) => {
@@ -11,7 +12,7 @@ const initCharacter = ({ runtime }: { runtime: IAgentRuntime }) => {
 export const projectAgent: ProjectAgent = {
   character,
   init: async (runtime: IAgentRuntime) => await initCharacter({ runtime }),
-  plugins: [footyPlugin, starterPlugin],
+  plugins: [footyPlugin, starterPlugin, farcasterPlugin],
 };
 
 const project: Project = {

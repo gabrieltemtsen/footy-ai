@@ -31,6 +31,7 @@
     "@elizaos/client": "1.6.4",
     "@elizaos/core": "1.6.4",
     "@elizaos/plugin-bootstrap": "1.6.4",
+    "@elizaos/plugin-farcaster": "^1.0.5",
     "@elizaos/plugin-google-genai": "^1.1.0",
     "@elizaos/plugin-ollama": "^1.2.4",
     "@elizaos/plugin-sql": "1.6.4",
