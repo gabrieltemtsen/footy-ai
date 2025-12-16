@@ -40,7 +40,11 @@ export const character: Character = {
     ...(!process.env.IGNORE_BOOTSTRAP ? ['@elizaos/plugin-bootstrap'] : []),
   ],
   settings: {
-    secrets: {},
+    secrets: {
+      FARCASTER_FID: process.env.FARCASTER_FID,
+      FARCASTER_NEYNAR_API_KEY: process.env.FARCASTER_NEYNAR_API_KEY,
+      FARCASTER_SIGNER_UUID: process.env.FARCASTER_SIGNER_UUID,
+    },
     avatar: 'https://elizaos.github.io/eliza-avatars/Eliza/portrait.png', // TODO: Update with a football avatar
   },
   system:

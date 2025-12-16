@@ -28,7 +28,7 @@ lerna-debug.log*
 
 # ElizaOS
 .eliza
-.eliza.backup
+.eliza.backup*
 db.sqlite
 *.sqlite
 *.db
