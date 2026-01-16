@@ -10,7 +10,7 @@ import {
     type State,
     logger,
 } from '@elizaos/core';
-import { FootballApiService, leagues } from './services/football-api.ts';
+import { FootballApiService, leagues, type LiveMatch, type StandingsEntry } from './services/football-api.ts';
 
 // --- SERVICE INSTANCE ---
 const apiService = new FootballApiService();
@@ -223,12 +223,199 @@ const predictMatchAction: Action = {
     ],
 };
 
+// --- NEW: LIVE SCORES ACTION ---
+
+const getLiveScoresAction: Action = {
+    name: 'GET_LIVE_SCORES',
+    similes: ['LIVE_MATCHES', 'CURRENT_SCORES', 'WHATS_HAPPENING', 'LIVE_GAMES', 'SCORES_NOW'],
+    description: 'Gets the current live match scores from all major football leagues.',
+    validate: async (_runtime: IAgentRuntime, _message: Memory) => true,
+    handler: async (
+        _runtime: IAgentRuntime,
+        _message: Memory,
+        _state: State,
+        _options: any,
+        callback: HandlerCallback
+    ): Promise<ActionResult> => {
+        try {
+            const liveMatches = await apiService.getLiveMatches();
+
+            if (liveMatches.length === 0) {
+                // No live matches, show next upcoming fixtures instead
+                const upcomingFixtures = await apiService.getUpcomingFixtures('epl', 3);
+                let responseText = "⚽ **No matches are live right now.**\n\n";
+
+                if (upcomingFixtures.length > 0) {
+                    responseText += "**Coming up next:**\n";
+                    responseText += upcomingFixtures.map(
+                        (f) => `- ${f.homeTeam.name} vs ${f.awayTeam.name} (${f.league}) - ${new Date(f.date).toLocaleString()}`
+                    ).join('\n');
+                }
+
+                const response: Content = {
+                    text: responseText,
+                    actions: ['GET_LIVE_SCORES'],
+                };
+                await callback(response);
+                return { success: true };
+            }
+
+            // Format live matches with scores and events
+            let responseText = "🔴 **LIVE MATCHES**\n\n";
+
+            // Group by league
+            const byLeague = liveMatches.reduce((acc, match) => {
+                if (!acc[match.league]) acc[match.league] = [];
+                acc[match.league].push(match);
+                return acc;
+            }, {} as Record<string, LiveMatch[]>);
+
+            for (const [league, matches] of Object.entries(byLeague)) {
+                responseText += `**${league}**\n`;
+                for (const match of matches) {
+                    responseText += `⚽ **${match.homeTeam.name} ${match.homeTeam.score} - ${match.awayTeam.score} ${match.awayTeam.name}** (${match.minute})\n`;
+
+                    // Show goal scorers if any
+                    const goals = match.events.filter(e => e.type === 'goal');
+                    if (goals.length > 0) {
+                        const goalText = goals.map(g => `  ⚽ ${g.player} (${g.minute})`).join('\n');
+                        responseText += goalText + '\n';
+                    }
+                }
+                responseText += '\n';
+            }
+
+            const response: Content = {
+                text: responseText.trim(),
+                actions: ['GET_LIVE_SCORES'],
+            };
+
+            await callback(response);
+            return { success: true };
+
+        } catch (error) {
+            logger.error('Error fetching live scores:', error);
+            const response: Content = {
+                text: "Sorry, I couldn't fetch live scores right now. Please try again in a moment.",
+                actions: ['GET_LIVE_SCORES'],
+            };
+            await callback(response);
+            return { success: false };
+        }
+    },
+    examples: [
+        [
+            { name: '{{name1}}', content: { text: 'What are the live scores?' } },
+            { name: '{{name2}}', content: { text: '🔴 LIVE MATCHES...', actions: ['GET_LIVE_SCORES'] } },
+        ],
+        [
+            { name: '{{name1}}', content: { text: 'Any games on right now?' } },
+            { name: '{{name2}}', content: { text: '🔴 LIVE MATCHES...', actions: ['GET_LIVE_SCORES'] } },
+        ],
+        [
+            { name: '{{name1}}', content: { text: "What's the current score?" } },
+            { name: '{{name2}}', content: { text: '🔴 LIVE MATCHES...', actions: ['GET_LIVE_SCORES'] } },
+        ],
+    ],
+};
+
+// --- NEW: STANDINGS ACTION ---
+
+const getStandingsAction: Action = {
+    name: 'GET_STANDINGS',
+    similes: ['LEAGUE_TABLE', 'SHOW_TABLE', 'POSITIONS', 'STANDINGS', 'TABLE'],
+    description: 'Gets the current league standings/table for a specified football league.',
+    validate: async (_runtime: IAgentRuntime, _message: Memory) => true,
+    handler: async (
+        _runtime: IAgentRuntime,
+        message: Memory,
+        _state: State,
+        _options: any,
+        callback: HandlerCallback
+    ): Promise<ActionResult> => {
+        const content = (message.content.text || '').toLowerCase();
+
+        // Detect which league the user wants
+        let leagueId = 'epl'; // Default to EPL
+        let leagueName = 'Premier League';
+
+        if (content.includes('la liga') || content.includes('spanish')) {
+            leagueId = 'laliga';
+            leagueName = 'La Liga';
+        } else if (content.includes('bundesliga') || content.includes('german')) {
+            leagueId = 'bund';
+            leagueName = 'Bundesliga';
+        } else if (content.includes('mls') || content.includes('major league')) {
+            leagueId = 'mls';
+            leagueName = 'MLS';
+        } else if (content.includes('championship') || content.includes('eng 2')) {
+            leagueId = 'eng-2';
+            leagueName = 'Championship';
+        }
+
+        try {
+            const standings = await apiService.getLeagueStandings(leagueId);
+
+            if (standings.length === 0) {
+                const response: Content = {
+                    text: `Sorry, I couldn't fetch the ${leagueName} standings right now.`,
+                    actions: ['GET_STANDINGS'],
+                };
+                await callback(response);
+                return { success: false };
+            }
+
+            // Show top 10 (or all if less)
+            const top = standings.slice(0, 10);
+            let responseText = `📊 **${leagueName} Standings**\n\n`;
+            responseText += "| Pos | Team | Pts | P | W | D | L | GD |\n";
+            responseText += "|-----|------|-----|---|---|---|---|----|\n";
+
+            for (const entry of top) {
+                const gd = entry.goalDifference >= 0 ? `+${entry.goalDifference}` : `${entry.goalDifference}`;
+                responseText += `| ${entry.position} | ${entry.team} | **${entry.points}** | ${entry.played} | ${entry.wins} | ${entry.draws} | ${entry.losses} | ${gd} |\n`;
+            }
+
+            const response: Content = {
+                text: responseText,
+                actions: ['GET_STANDINGS'],
+            };
+
+            await callback(response);
+            return { success: true };
+
+        } catch (error) {
+            logger.error('Error fetching standings:', error);
+            const response: Content = {
+                text: `Sorry, I couldn't fetch the ${leagueName} standings right now. Please try again.`,
+                actions: ['GET_STANDINGS'],
+            };
+            await callback(response);
+            return { success: false };
+        }
+    },
+    examples: [
+        [
+            { name: '{{name1}}', content: { text: 'Show me the Premier League table' } },
+            { name: '{{name2}}', content: { text: '📊 Premier League Standings...', actions: ['GET_STANDINGS'] } },
+        ],
+        [
+            { name: '{{name1}}', content: { text: 'La Liga standings' } },
+            { name: '{{name2}}', content: { text: '📊 La Liga Standings...', actions: ['GET_STANDINGS'] } },
+        ],
+        [
+            { name: '{{name1}}', content: { text: "Who's top of the league?" } },
+            { name: '{{name2}}', content: { text: '📊 Premier League Standings...', actions: ['GET_STANDINGS'] } },
+        ],
+    ],
+};
+
 // --- PLUGIN DEFINITION ---
 
 export const footyPlugin: Plugin = {
     name: 'footy',
-    description: 'Football data, predictions, and fantasy advice.',
-    actions: [getFixturesAction, getFantasyAdviceAction, predictMatchAction],
+    description: 'Football data, predictions, live scores, standings, and fantasy advice.',
+    actions: [getFixturesAction, getFantasyAdviceAction, predictMatchAction, getLiveScoresAction, getStandingsAction],
     providers: [footballDataProvider],
 };
 

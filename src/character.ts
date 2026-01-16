@@ -49,8 +49,8 @@ export const character: Character = {
       NEYNAR_API_KEY: process.env.FARCASTER_NEYNAR_API_KEY,
       SIGNER_UUID: process.env.FARCASTER_SIGNER_UUID,
     },
-    // Farcaster plugin (bundled) accesses these directly from settings, not secrets
-    FARCASTER_FID: parseInt(process.env.FARCASTER_FID || '0', 10),
+    // Farcaster plugin accesses these directly from settings (as strings, plugin parses internally)
+    FARCASTER_FID: process.env.FARCASTER_FID || '',
     FARCASTER_NEYNAR_API_KEY: process.env.FARCASTER_NEYNAR_API_KEY || '',
     FARCASTER_SIGNER_UUID: process.env.FARCASTER_SIGNER_UUID || '',
     avatar: 'https://elizaos.github.io/eliza-avatars/Eliza/portrait.png', // TODO: Update with a football avatar
