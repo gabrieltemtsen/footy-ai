@@ -10,23 +10,11 @@ import {
     type State,
     logger,
 } from '@elizaos/core';
-import { FootballApiService, leagues, type LiveMatch, type StandingsEntry } from './services/football-api.ts';
+import { FootballApiService, leagues, type Fixture, type LiveMatch, type StandingsEntry } from './services/football-api.ts';
+import { bwapsApiService, type BwapsLease } from './services/bwaps-api.ts';
 
-// --- SERVICE INSTANCE ---
+// --- SERVICE INSTANCES ---
 const apiService = new FootballApiService();
-
-// --- MOCK DATA (Fallback) ---
-const MOCK_FIXTURES = [
-    { id: 1, home: 'Arsenal', away: 'Tottenham', date: '2025-12-06T12:30:00Z', competition: 'Premier League' },
-    { id: 2, home: 'Liverpool', away: 'Man City', date: '2025-12-06T15:00:00Z', competition: 'Premier League' },
-    { id: 3, home: 'Real Madrid', away: 'Barcelona', date: '2025-12-07T20:00:00Z', competition: 'La Liga' },
-];
-
-const MOCK_FPL_ADVICE = [
-    { player: 'Haaland', team: 'Man City', reason: 'High xG against Liverpools high line.', recommendation: 'Captain' },
-    { player: 'Saka', team: 'Arsenal', reason: 'Consistent returns, facing a leaky Spurs defense.', recommendation: 'Buy' },
-    { player: 'Salah', team: 'Liverpool', reason: 'Always scores in big games.', recommendation: 'Keep' },
-];
 
 // --- PROVIDER ---
 
@@ -72,11 +60,6 @@ const getFixturesAction: Action = {
         if (content.includes('bundesliga') || content.includes('german')) {
             targetLeagues.push('bund');
         }
-        if (content.includes('serie a') || content.includes('italian')) {
-            // Note: Serie A is not in our current leagues list in football-api.ts, need to check if supported or add it.
-            // For now, let's stick to what we have.
-            // targetLeagues.push('seriea'); 
-        }
         if (content.includes('champions league') || content.includes('ucl')) {
             targetLeagues.push('ucl');
         }
@@ -86,12 +69,11 @@ const getFixturesAction: Action = {
 
         // If "all" is requested or no specific league found, fetch top leagues
         if (content.includes('all') || targetLeagues.length === 0) {
-            // Default to top leagues if no specific one is asked for
             targetLeagues = ['epl', 'laliga', 'bund', 'ucl', 'mls'];
         }
 
         try {
-            const allFixtures = [];
+            const allFixtures: Fixture[] = [];
 
             for (const leagueId of targetLeagues) {
                 const fixtures = await apiService.getUpcomingFixtures(leagueId);
@@ -106,11 +88,11 @@ const getFixturesAction: Action = {
                     if (!acc[f.league]) acc[f.league] = [];
                     acc[f.league].push(f);
                     return acc;
-                }, {} as Record<string, typeof allFixtures>);
+                }, {} as Record<string, Fixture[]>);
 
-                fixturesText = Object.entries(grouped).map(([leagueName, fixtures]) => {
+                fixturesText = Object.entries(grouped).map(([leagueName, leagueFixtures]) => {
                     const leagueHeader = `\n**${leagueName}**\n`;
-                    const matches = fixtures.map(
+                    const matches = leagueFixtures.map(
                         (f) => `- ${f.homeTeam.name} vs ${f.awayTeam.name} on ${new Date(f.date).toDateString()} (${f.status.short})`
                     ).join('\n');
                     return leagueHeader + matches;
@@ -120,10 +102,8 @@ const getFixturesAction: Action = {
                 fixturesText = "No upcoming fixtures found for the requested leagues.";
             }
         } catch (e) {
-            logger.warn("Failed to fetch live fixtures, using mock data.", e);
-            fixturesText = MOCK_FIXTURES.map(
-                (f) => `- ${f.home} vs ${f.away} (${f.competition}) on ${new Date(f.date).toDateString()} (MOCK DATA)`
-            ).join('\n');
+            logger.warn("Failed to fetch fixtures:", e);
+            fixturesText = "Unable to fetch fixtures at this time. Please try again later.";
         }
 
         const response: Content = {
@@ -150,10 +130,12 @@ const getFixturesAction: Action = {
     ],
 };
 
-const getFantasyAdviceAction: Action = {
-    name: 'GET_FANTASY_ADVICE',
-    similes: ['FPL_TIPS', 'FANTASY_HELP', 'WHO_TO_CAPTAIN'],
-    description: 'Provides advice for Fantasy Football (FPL).',
+// --- BETTING MARKETS ACTION (BWAPs) ---
+
+const getBettingMarketsAction: Action = {
+    name: 'GET_BETTING_MARKETS',
+    similes: ['BETTING_ODDS', 'PREDICTION_MARKETS', 'ACTIVE_MARKETS', 'AVAILABLE_BETS', 'MARKET_ODDS'],
+    description: 'Lists all active soccer betting markets with prediction market data from Polymarket and Kalshi.',
     validate: async (_runtime: IAgentRuntime, _message: Memory) => true,
     handler: async (
         _runtime: IAgentRuntime,
@@ -162,13 +144,379 @@ const getFantasyAdviceAction: Action = {
         _options: any,
         callback: HandlerCallback
     ): Promise<ActionResult> => {
-        // FPL API usually requires authentication or complex scraping, so keeping mock for now
-        const adviceText = MOCK_FPL_ADVICE.map(
-            (a) => `- **${a.player}** (${a.team}): ${a.recommendation}. ${a.reason}`
-        ).join('\n');
+        try {
+            const leases = await bwapsApiService.getActiveLeases();
+
+            if (leases.count === 0) {
+                const response: Content = {
+                    text: "📊 **No active betting markets found.**\n\nCheck back later for upcoming matches with prediction market odds.",
+                    actions: ['GET_BETTING_MARKETS'],
+                };
+                await callback(response);
+                return { success: true };
+            }
+
+            // Filter to only show upcoming matches (not past)
+            const upcomingLeases = leases.leases.filter(l => !l.isPast);
+
+            let responseText = "📊 **Active Betting Markets**\n\n";
+            responseText += `Found **${upcomingLeases.length}** matches with prediction market odds:\n\n`;
+
+            for (const lease of upcomingLeases.slice(0, 10)) { // Limit to 10
+                const matchDate = new Date(lease.startTime);
+                const dateStr = matchDate.toLocaleDateString('en-US', {
+                    weekday: 'short',
+                    month: 'short',
+                    day: 'numeric',
+                    hour: '2-digit',
+                    minute: '2-digit'
+                });
+
+                responseText += `⚽ **${lease.homeTeam}** vs **${lease.awayTeam}**\n`;
+                responseText += `   📅 ${dateStr}\n`;
+                responseText += `   🔗 Sources: ${lease.sourceUrls.length} prediction markets\n\n`;
+            }
+
+            responseText += "\n💡 *Ask me for specific match odds, e.g. 'What are the odds for Tottenham vs West Ham?'*";
+
+            const response: Content = {
+                text: responseText,
+                actions: ['GET_BETTING_MARKETS'],
+            };
+
+            await callback(response);
+            return { success: true };
+
+        } catch (error) {
+            logger.error('Error fetching betting markets:', error);
+            const response: Content = {
+                text: "Sorry, I couldn't fetch the betting markets right now. Please try again in a moment.",
+                actions: ['GET_BETTING_MARKETS'],
+            };
+            await callback(response);
+            return { success: false };
+        }
+    },
+    examples: [
+        [
+            { name: '{{name1}}', content: { text: 'What betting markets are available?' } },
+            { name: '{{name2}}', content: { text: '📊 Active Betting Markets...', actions: ['GET_BETTING_MARKETS'] } },
+        ],
+        [
+            { name: '{{name1}}', content: { text: 'Show me prediction markets' } },
+            { name: '{{name2}}', content: { text: '📊 Active Betting Markets...', actions: ['GET_BETTING_MARKETS'] } },
+        ],
+        [
+            { name: '{{name1}}', content: { text: 'What matches have odds?' } },
+            { name: '{{name2}}', content: { text: '📊 Active Betting Markets...', actions: ['GET_BETTING_MARKETS'] } },
+        ],
+    ],
+};
+
+// --- MATCH ODDS ACTION (BWAPs) ---
+
+const getMatchOddsAction: Action = {
+    name: 'GET_MATCH_ODDS',
+    similes: ['MATCH_PROBABILITIES', 'WIN_PROBABILITY', 'ODDS_FOR_MATCH', 'BETTING_ODDS_MATCH'],
+    description: 'Gets aggregated prediction market probabilities for a specific soccer match using belief-weighted aggregation from Polymarket and Kalshi.',
+    validate: async (_runtime: IAgentRuntime, _message: Memory) => true,
+    handler: async (
+        _runtime: IAgentRuntime,
+        message: Memory,
+        _state: State,
+        _options: any,
+        callback: HandlerCallback
+    ): Promise<ActionResult> => {
+        const content = (message.content.text || '').toLowerCase();
+
+        try {
+            // First, get all active leases
+            const leases = await bwapsApiService.getActiveLeases();
+
+            if (leases.count === 0) {
+                const response: Content = {
+                    text: "No active prediction markets found. Check back later for upcoming matches.",
+                    actions: ['GET_MATCH_ODDS'],
+                };
+                await callback(response);
+                return { success: true };
+            }
+
+            // Try to find a matching lease based on team names in the message
+            let matchingLease: BwapsLease | null = null;
+
+            for (const lease of leases.leases) {
+                const homeTeamLower = lease.homeTeam.toLowerCase();
+                const awayTeamLower = lease.awayTeam.toLowerCase();
+
+                // Check if both teams are mentioned in the message
+                const homeWords = homeTeamLower.split(' ');
+                const awayWords = awayTeamLower.split(' ');
+
+                const homeMatch = homeWords.some(word => word.length > 3 && content.includes(word));
+                const awayMatch = awayWords.some(word => word.length > 3 && content.includes(word));
+
+                if (homeMatch && awayMatch) {
+                    matchingLease = lease;
+                    break;
+                }
+
+                // Also check for common abbreviations
+                if (content.includes('tottenham') || content.includes('spurs')) {
+                    if (homeTeamLower.includes('tottenham') || awayTeamLower.includes('tottenham')) {
+                        matchingLease = lease;
+                    }
+                }
+            }
+
+            if (!matchingLease) {
+                // If no match found, show available markets
+                const availableMatches = leases.leases
+                    .filter(l => !l.isPast)
+                    .slice(0, 5)
+                    .map(l => `• ${l.homeTeam} vs ${l.awayTeam}`)
+                    .join('\n');
+
+                const response: Content = {
+                    text: `I couldn't find odds for that match. Here are the available markets:\n\n${availableMatches}\n\nTry asking about one of these matches!`,
+                    actions: ['GET_MATCH_ODDS'],
+                };
+                await callback(response);
+                return { success: true };
+            }
+
+            // Fetch the prediction probabilities
+            const probs = await bwapsApiService.getMatchProbabilities(matchingLease.leaseId);
+
+            // Format probabilities as percentages
+            const homePercent = (probs.homeWinProb * 100).toFixed(1);
+            const drawPercent = (probs.drawProb * 100).toFixed(1);
+            const awayPercent = (probs.awayWinProb * 100).toFixed(1);
+
+            // Create a visual bar for each probability
+            const createBar = (prob: number) => {
+                const filled = Math.round(prob * 10);
+                return '█'.repeat(filled) + '░'.repeat(10 - filled);
+            };
+
+            let responseText = `🎯 **Prediction Market Odds**\n\n`;
+            responseText += `**${probs.homeTeam}** vs **${probs.awayTeam}**\n\n`;
+            responseText += `| Outcome | Probability |\n`;
+            responseText += `|---------|-------------|\n`;
+            responseText += `| 🏠 Home Win | ${createBar(probs.homeWinProb)} **${homePercent}%** |\n`;
+            responseText += `| 🤝 Draw | ${createBar(probs.drawProb)} **${drawPercent}%** |\n`;
+            responseText += `| ✈️ Away Win | ${createBar(probs.awayWinProb)} **${awayPercent}%** |\n\n`;
+
+            // Market quality signals
+            responseText += `📈 **Market Quality**\n`;
+            responseText += `• Liquidity: $${probs.liquidity.toLocaleString()}\n`;
+            responseText += `• Volume: $${probs.volume.toLocaleString()}\n`;
+            responseText += `• Sources: ${probs.sourceCount} prediction markets\n`;
+            responseText += `• Updated: ${new Date(probs.asOf).toLocaleString()}\n\n`;
+
+            // Determine the favorite
+            const maxProb = Math.max(probs.homeWinProb, probs.drawProb, probs.awayWinProb);
+            let favoriteText = '';
+            if (maxProb === probs.homeWinProb) {
+                favoriteText = `🔮 **Prediction:** ${probs.homeTeam} is favored to win`;
+            } else if (maxProb === probs.awayWinProb) {
+                favoriteText = `🔮 **Prediction:** ${probs.awayTeam} is favored to win`;
+            } else {
+                favoriteText = `🔮 **Prediction:** This match is expected to be a draw`;
+            }
+            responseText += favoriteText;
+
+            const response: Content = {
+                text: responseText,
+                actions: ['GET_MATCH_ODDS'],
+            };
+
+            await callback(response);
+            return { success: true };
+
+        } catch (error) {
+            logger.error('Error fetching match odds:', error);
+            const response: Content = {
+                text: `Sorry, I couldn't fetch the odds for that match. Error: ${error instanceof Error ? error.message : 'Unknown error'}`,
+                actions: ['GET_MATCH_ODDS'],
+            };
+            await callback(response);
+            return { success: false };
+        }
+    },
+    examples: [
+        [
+            { name: '{{name1}}', content: { text: 'What are the odds for Tottenham vs West Ham?' } },
+            { name: '{{name2}}', content: { text: '🎯 Prediction Market Odds...', actions: ['GET_MATCH_ODDS'] } },
+        ],
+        [
+            { name: '{{name1}}', content: { text: 'Who is favored to win Arsenal vs Chelsea?' } },
+            { name: '{{name2}}', content: { text: '🎯 Prediction Market Odds...', actions: ['GET_MATCH_ODDS'] } },
+        ],
+        [
+            { name: '{{name1}}', content: { text: 'Show me the betting probabilities for Liverpool vs Man City' } },
+            { name: '{{name2}}', content: { text: '🎯 Prediction Market Odds...', actions: ['GET_MATCH_ODDS'] } },
+        ],
+    ],
+};
+
+// --- PREDICT MATCH ACTION (Enhanced with BWAPs) ---
+
+const predictMatchAction: Action = {
+    name: 'PREDICT_MATCH',
+    similes: ['MATCH_PREDICTION', 'WHO_WILL_WIN', 'PREDICT_WINNER'],
+    description: 'Predicts the outcome of a football match using real prediction market data from Polymarket and Kalshi.',
+    validate: async (_runtime: IAgentRuntime, _message: Memory) => true,
+    handler: async (
+        runtime: IAgentRuntime,
+        message: Memory,
+        _state: State,
+        _options: any,
+        callback: HandlerCallback
+    ): Promise<ActionResult> => {
+        const content = (message.content.text || '').toLowerCase();
+
+        try {
+            // First, try to get BWAPs data for this match
+            const leases = await bwapsApiService.getActiveLeases();
+            let matchingLease: BwapsLease | null = null;
+
+            for (const lease of leases.leases) {
+                const homeTeamLower = lease.homeTeam.toLowerCase();
+                const awayTeamLower = lease.awayTeam.toLowerCase();
+
+                const homeWords = homeTeamLower.split(' ');
+                const awayWords = awayTeamLower.split(' ');
+
+                const homeMatch = homeWords.some(word => word.length > 3 && content.includes(word));
+                const awayMatch = awayWords.some(word => word.length > 3 && content.includes(word));
+
+                if (homeMatch || awayMatch) {
+                    matchingLease = lease;
+                    break;
+                }
+            }
+
+            if (matchingLease) {
+                // We have BWAPs data - use real probabilities
+                const probs = await bwapsApiService.getMatchProbabilities(matchingLease.leaseId);
+
+                const homePercent = (probs.homeWinProb * 100).toFixed(1);
+                const drawPercent = (probs.drawProb * 100).toFixed(1);
+                const awayPercent = (probs.awayWinProb * 100).toFixed(1);
+
+                let prediction = '';
+                let confidence = '';
+
+                // Determine prediction based on probabilities
+                const maxProb = Math.max(probs.homeWinProb, probs.drawProb, probs.awayWinProb);
+                const margin = maxProb - (1 - maxProb) / 2;
+
+                if (margin > 0.2) {
+                    confidence = "High confidence";
+                } else if (margin > 0.1) {
+                    confidence = "Moderate confidence";
+                } else {
+                    confidence = "Low confidence - this is a close match!";
+                }
+
+                if (maxProb === probs.homeWinProb) {
+                    prediction = `🏆 **${probs.homeTeam}** to win at home`;
+                } else if (maxProb === probs.awayWinProb) {
+                    prediction = `🏆 **${probs.awayTeam}** to win away`;
+                } else {
+                    prediction = `🤝 **Draw** is the most likely outcome`;
+                }
+
+                let responseText = `🔮 **Match Prediction**\n\n`;
+                responseText += `**${probs.homeTeam}** vs **${probs.awayTeam}**\n\n`;
+                responseText += `${prediction}\n\n`;
+                responseText += `📊 **Market Probabilities:**\n`;
+                responseText += `• Home: ${homePercent}%\n`;
+                responseText += `• Draw: ${drawPercent}%\n`;
+                responseText += `• Away: ${awayPercent}%\n\n`;
+                responseText += `📈 **${confidence}**\n`;
+                responseText += `💰 Based on $${probs.volume.toLocaleString()} in trading volume from ${probs.sourceCount} prediction markets.`;
+
+                const response: Content = {
+                    text: responseText,
+                    actions: ['PREDICT_MATCH'],
+                };
+
+                await callback(response);
+                return { success: true };
+            }
+
+            // No BWAPs data available - fall back to general response
+            const response: Content = {
+                text: "I don't have prediction market data for that match. Try asking about matches from the active betting markets!\n\nSay 'show betting markets' to see available matches with odds.",
+                actions: ['PREDICT_MATCH'],
+            };
+
+            await callback(response);
+            return { success: true };
+
+        } catch (error) {
+            logger.error('Error in PREDICT_MATCH:', error);
+            const response: Content = {
+                text: "Sorry, I couldn't generate a prediction at this time. Please try again.",
+                actions: ['PREDICT_MATCH'],
+            };
+            await callback(response);
+            return { success: false };
+        }
+    },
+    examples: [
+        [
+            { name: '{{name1}}', content: { text: 'Who wins Arsenal vs Spurs?' } },
+            { name: '{{name2}}', content: { text: '🔮 Match Prediction...', actions: ['PREDICT_MATCH'] } },
+        ],
+        [
+            { name: '{{name1}}', content: { text: 'Predict the Liverpool vs Man City match' } },
+            { name: '{{name2}}', content: { text: '🔮 Match Prediction...', actions: ['PREDICT_MATCH'] } },
+        ],
+    ],
+};
+
+// --- FPL ADVICE ACTION ---
+
+const getFantasyAdviceAction: Action = {
+    name: 'GET_FANTASY_ADVICE',
+    similes: ['FPL_TIPS', 'FANTASY_HELP', 'WHO_TO_CAPTAIN'],
+    description: 'Provides advice for Fantasy Football (FPL) based on upcoming fixture data.',
+    validate: async (_runtime: IAgentRuntime, _message: Memory) => true,
+    handler: async (
+        _runtime: IAgentRuntime,
+        _message: Memory,
+        _state: State,
+        _options: any,
+        callback: HandlerCallback
+    ): Promise<ActionResult> => {
+        // Try to get betting markets for context
+        let contextText = "";
+        try {
+            const leases = await bwapsApiService.getActiveLeases();
+            if (leases.count > 0) {
+                const upcomingMatches = leases.leases
+                    .filter(l => !l.isPast)
+                    .slice(0, 3)
+                    .map(l => `${l.homeTeam} vs ${l.awayTeam}`)
+                    .join(', ');
+                contextText = `\n\n📅 **Upcoming matches with market data:** ${upcomingMatches}`;
+            }
+        } catch (e) {
+            logger.warn("Could not fetch betting markets for FPL context");
+        }
 
         const response: Content = {
-            text: `Here is my FPL advice for this week:\n${adviceText}`,
+            text: `Here is my FPL advice for this week:
+
+📋 **General Tips:**
+- Check prediction market odds before picking your captain
+- Players from teams with high win probability are safer picks
+- Consider home advantage in close fixtures
+
+💡 **Pro Tip:** Use the "get match odds" command to see real-time probabilities for specific fixtures!${contextText}`,
             actions: ['GET_FANTASY_ADVICE'],
         };
 
@@ -183,47 +531,7 @@ const getFantasyAdviceAction: Action = {
     ],
 };
 
-const predictMatchAction: Action = {
-    name: 'PREDICT_MATCH',
-    similes: ['MATCH_PREDICTION', 'WHO_WILL_WIN'],
-    description: 'Predicts the outcome of a football match.',
-    validate: async (_runtime: IAgentRuntime, _message: Memory) => true,
-    handler: async (
-        _runtime: IAgentRuntime,
-        message: Memory,
-        _state: State,
-        _options: any,
-        callback: HandlerCallback
-    ): Promise<ActionResult> => {
-        // Simple logic to pick a winner based on the message content (mock AI)
-        const content = (message.content.text || '').toLowerCase();
-        let prediction = "It's too close to call!";
-
-        if (content.includes('arsenal') && content.includes('tottenham')) {
-            prediction = "I'm backing **Arsenal** to win 2-1. They have the home advantage and better form.";
-        } else if (content.includes('liverpool') && content.includes('city')) {
-            prediction = "This is a titan clash. I predict a **2-2 Draw**. Both attacks are too strong.";
-        } else {
-            prediction = "I'd need to see the lineups first, but I generally favor the home team in these clashes.";
-        }
-
-        const response: Content = {
-            text: prediction,
-            actions: ['PREDICT_MATCH'],
-        };
-
-        await callback(response);
-        return { success: true };
-    },
-    examples: [
-        [
-            { name: '{{name1}}', content: { text: 'Who wins Arsenal vs Spurs?' } },
-            { name: '{{name2}}', content: { text: 'I predict Arsenal...', actions: ['PREDICT_MATCH'] } },
-        ],
-    ],
-};
-
-// --- NEW: LIVE SCORES ACTION ---
+// --- LIVE SCORES ACTION ---
 
 const getLiveScoresAction: Action = {
     name: 'GET_LIVE_SCORES',
@@ -319,7 +627,7 @@ const getLiveScoresAction: Action = {
     ],
 };
 
-// --- NEW: STANDINGS ACTION ---
+// --- STANDINGS ACTION ---
 
 const getStandingsAction: Action = {
     name: 'GET_STANDINGS',
@@ -369,7 +677,7 @@ const getStandingsAction: Action = {
             const top = standings.slice(0, 10);
             let responseText = `📊 **${leagueName} Standings**\n\n`;
             responseText += "| Pos | Team | Pts | P | W | D | L | GD |\n";
-            responseText += "|-----|------|-----|---|---|---|---|----|\n";
+            responseText += "|-----|------|-----|---|---|---|---|----|\ n";
 
             for (const entry of top) {
                 const gd = entry.goalDifference >= 0 ? `+${entry.goalDifference}` : `${entry.goalDifference}`;
@@ -414,8 +722,16 @@ const getStandingsAction: Action = {
 
 export const footyPlugin: Plugin = {
     name: 'footy',
-    description: 'Football data, predictions, live scores, standings, and fantasy advice.',
-    actions: [getFixturesAction, getFantasyAdviceAction, predictMatchAction, getLiveScoresAction, getStandingsAction],
+    description: 'Football data, predictions with real market odds, live scores, standings, and fantasy advice.',
+    actions: [
+        getFixturesAction,
+        getBettingMarketsAction,  // NEW: BWAPs integration
+        getMatchOddsAction,       // NEW: BWAPs integration  
+        predictMatchAction,       // UPDATED: Uses BWAPs data
+        getFantasyAdviceAction,
+        getLiveScoresAction,
+        getStandingsAction
+    ],
     providers: [footballDataProvider],
 };
 
