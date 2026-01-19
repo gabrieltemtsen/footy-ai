@@ -27,7 +27,7 @@
     "dist"
   ],
   "dependencies": {
-    "@elizaos/cli": "1.6.4",
+    "@elizaos/cli": "1.7.2",
     "@elizaos/client": "1.6.4",
     "@elizaos/core": "1.6.4",
     "@elizaos/plugin-bootstrap": "1.6.4",
