@@ -16,6 +16,33 @@ import { bwapsApiService, type BwapsLease } from './services/bwaps-api.ts';
 // --- SERVICE INSTANCES ---
 const apiService = new FootballApiService();
 
+const extractEventKey = (text: string): string | null => {
+    const match = text.match(/eventKey\s*[:=]?\s*([a-zA-Z0-9_:\-.]+)/i) || text.match(/\b(ev_[a-zA-Z0-9_:\-.]+)\b/i);
+    return match?.[1] || null;
+};
+
+const findLeaseFromText = (leases: BwapsLease[], text: string): BwapsLease | null => {
+    const content = text.toLowerCase();
+
+    const byEventKey = extractEventKey(text);
+    if (byEventKey) {
+        const lease = leases.find((l) => l.eventKey === byEventKey || l.leaseId === byEventKey);
+        if (lease) return lease;
+    }
+
+    for (const lease of leases) {
+        const homeWords = lease.homeTeam.toLowerCase().split(' ');
+        const awayWords = lease.awayTeam.toLowerCase().split(' ');
+
+        const homeMatch = homeWords.some((word) => word.length > 3 && content.includes(word));
+        const awayMatch = awayWords.some((word) => word.length > 3 && content.includes(word));
+
+        if (homeMatch && awayMatch) return lease;
+    }
+
+    return null;
+};
+
 // --- PROVIDER ---
 
 const footballDataProvider: Provider = {
@@ -135,7 +162,7 @@ const getFixturesAction: Action = {
 const getBettingMarketsAction: Action = {
     name: 'GET_BETTING_MARKETS',
     similes: ['BETTING_ODDS', 'PREDICTION_MARKETS', 'ACTIVE_MARKETS', 'AVAILABLE_BETS', 'MARKET_ODDS'],
-    description: 'Lists all active soccer betting markets with prediction market data from Polymarket and Kalshi.',
+    description: 'Lists active ChanceDB probability markets across supported sports with prediction market sources.',
     validate: async (_runtime: IAgentRuntime, _message: Memory) => true,
     handler: async (
         _runtime: IAgentRuntime,
@@ -149,7 +176,7 @@ const getBettingMarketsAction: Action = {
 
             if (leases.count === 0) {
                 const response: Content = {
-                    text: "📊 **No active betting markets found.**\n\nCheck back later for upcoming matches with prediction market odds.",
+                    text: "📊 **No active ChanceDB markets found right now.**\n\nTry again shortly to see supported sports/events and current probabilities.",
                     actions: ['GET_BETTING_MARKETS'],
                 };
                 await callback(response);
@@ -159,8 +186,8 @@ const getBettingMarketsAction: Action = {
             // Filter to only show upcoming matches (not past)
             const upcomingLeases = leases.leases.filter(l => !l.isPast);
 
-            let responseText = "📊 **Active Betting Markets**\n\n";
-            responseText += `Found **${upcomingLeases.length}** matches with prediction market odds:\n\n`;
+            let responseText = "📊 **Active ChanceDB Markets**\n\n";
+            responseText += `Found **${upcomingLeases.length}** active events with live probability surfaces:\n\n`;
 
             for (const lease of upcomingLeases.slice(0, 10)) { // Limit to 10
                 const matchDate = new Date(lease.startTime);
@@ -174,10 +201,11 @@ const getBettingMarketsAction: Action = {
 
                 responseText += `⚽ **${lease.homeTeam}** vs **${lease.awayTeam}**\n`;
                 responseText += `   📅 ${dateStr}\n`;
+                responseText += `   🆔 eventKey: ${lease.eventKey || lease.leaseId}\n`;
                 responseText += `   🔗 Sources: ${lease.sourceUrls.length} prediction markets\n\n`;
             }
 
-            responseText += "\n💡 *Ask me for specific match odds, e.g. 'What are the odds for Tottenham vs West Ham?'*";
+            responseText += "\n💡 *Ask for probabilities by matchup or eventKey, e.g. 'probability Tottenham vs West Ham' or 'probability eventKey ev_xxx'.*";
 
             const response: Content = {
                 text: responseText,
@@ -218,7 +246,7 @@ const getBettingMarketsAction: Action = {
 const getMatchOddsAction: Action = {
     name: 'GET_MATCH_ODDS',
     similes: ['MATCH_PROBABILITIES', 'WIN_PROBABILITY', 'ODDS_FOR_MATCH', 'BETTING_ODDS_MATCH'],
-    description: 'Gets aggregated prediction market probabilities for a specific soccer match using belief-weighted aggregation from Polymarket and Kalshi.',
+    description: 'Gets aggregated ChanceDB probabilities for a specific event (by matchup text or eventKey).',
     validate: async (_runtime: IAgentRuntime, _message: Memory) => true,
     handler: async (
         _runtime: IAgentRuntime,
@@ -227,8 +255,6 @@ const getMatchOddsAction: Action = {
         _options: any,
         callback: HandlerCallback
     ): Promise<ActionResult> => {
-        const content = (message.content.text || '').toLowerCase();
-
         try {
             // First, get all active leases
             const leases = await bwapsApiService.getActiveLeases();
@@ -242,32 +268,8 @@ const getMatchOddsAction: Action = {
                 return { success: true };
             }
 
-            // Try to find a matching lease based on team names in the message
-            let matchingLease: BwapsLease | null = null;
-
-            for (const lease of leases.leases) {
-                const homeTeamLower = lease.homeTeam.toLowerCase();
-                const awayTeamLower = lease.awayTeam.toLowerCase();
-
-                // Check if both teams are mentioned in the message
-                const homeWords = homeTeamLower.split(' ');
-                const awayWords = awayTeamLower.split(' ');
-
-                const homeMatch = homeWords.some(word => word.length > 3 && content.includes(word));
-                const awayMatch = awayWords.some(word => word.length > 3 && content.includes(word));
-
-                if (homeMatch && awayMatch) {
-                    matchingLease = lease;
-                    break;
-                }
-
-                // Also check for common abbreviations
-                if (content.includes('tottenham') || content.includes('spurs')) {
-                    if (homeTeamLower.includes('tottenham') || awayTeamLower.includes('tottenham')) {
-                        matchingLease = lease;
-                    }
-                }
-            }
+            // Find by explicit eventKey or by matchup text
+            const matchingLease = findLeaseFromText(leases.leases, message.content.text || '');
 
             if (!matchingLease) {
                 // If no match found, show available markets
@@ -278,7 +280,7 @@ const getMatchOddsAction: Action = {
                     .join('\n');
 
                 const response: Content = {
-                    text: `I couldn't find odds for that match. Here are the available markets:\n\n${availableMatches}\n\nTry asking about one of these matches!`,
+                    text: `I couldn't match that event yet. Try: \n• probability <team A> vs <team B>\n• probability eventKey <EVENT_KEY>\n\nAvailable examples:\n${availableMatches}`,
                     actions: ['GET_MATCH_ODDS'],
                 };
                 await callback(response);
@@ -299,8 +301,9 @@ const getMatchOddsAction: Action = {
                 return '█'.repeat(filled) + '░'.repeat(10 - filled);
             };
 
-            let responseText = `🎯 **Prediction Market Odds**\n\n`;
-            responseText += `**${probs.homeTeam}** vs **${probs.awayTeam}**\n\n`;
+            let responseText = `🎯 **ChanceDB Probability Snapshot**\n\n`;
+            responseText += `**${probs.homeTeam}** vs **${probs.awayTeam}**\n`;
+            responseText += `eventKey: ${probs.eventKey}\n\n`;
             responseText += `| Outcome | Probability |\n`;
             responseText += `|---------|-------------|\n`;
             responseText += `| 🏠 Home Win | ${createBar(probs.homeWinProb)} **${homePercent}%** |\n`;
@@ -365,7 +368,7 @@ const getMatchOddsAction: Action = {
 const predictMatchAction: Action = {
     name: 'PREDICT_MATCH',
     similes: ['MATCH_PREDICTION', 'WHO_WILL_WIN', 'PREDICT_WINNER'],
-    description: 'Predicts the outcome of a football match using real prediction market data from Polymarket and Kalshi.',
+    description: 'Predicts likely outcome from ChanceDB probability surfaces (supports any listed event).
     validate: async (_runtime: IAgentRuntime, _message: Memory) => true,
     handler: async (
         runtime: IAgentRuntime,
@@ -374,28 +377,10 @@ const predictMatchAction: Action = {
         _options: any,
         callback: HandlerCallback
     ): Promise<ActionResult> => {
-        const content = (message.content.text || '').toLowerCase();
-
         try {
             // First, try to get BWAPs data for this match
             const leases = await bwapsApiService.getActiveLeases();
-            let matchingLease: BwapsLease | null = null;
-
-            for (const lease of leases.leases) {
-                const homeTeamLower = lease.homeTeam.toLowerCase();
-                const awayTeamLower = lease.awayTeam.toLowerCase();
-
-                const homeWords = homeTeamLower.split(' ');
-                const awayWords = awayTeamLower.split(' ');
-
-                const homeMatch = homeWords.some(word => word.length > 3 && content.includes(word));
-                const awayMatch = awayWords.some(word => word.length > 3 && content.includes(word));
-
-                if (homeMatch || awayMatch) {
-                    matchingLease = lease;
-                    break;
-                }
-            }
+            const matchingLease = findLeaseFromText(leases.leases, message.content.text || '');
 
             if (matchingLease) {
                 // We have BWAPs data - use real probabilities
@@ -718,6 +703,45 @@ const getStandingsAction: Action = {
     ],
 };
 
+const getProbabilityByEventKeyAction: Action = {
+    name: 'GET_PROBABILITY_BY_EVENTKEY',
+    similes: ['PROBABILITY_BY_EVENTKEY', 'SNAPSHOT_BY_EVENTKEY', 'EVENTKEY_ODDS'],
+    description: 'Fetch a ChanceDB probability snapshot directly with an eventKey.',
+    validate: async () => true,
+    handler: async (_runtime, message, _state, _options, callback) => {
+        const text = message.content.text || '';
+        const eventKey = extractEventKey(text);
+
+        if (!eventKey) {
+            await callback({
+                text: 'Please provide an eventKey. Example: probability eventKey ev_example',
+                actions: ['GET_PROBABILITY_BY_EVENTKEY'],
+            });
+            return { success: false };
+        }
+
+        try {
+            const probs = await bwapsApiService.getMatchProbabilities(eventKey);
+            const home = (probs.homeWinProb * 100).toFixed(1);
+            const draw = (probs.drawProb * 100).toFixed(1);
+            const away = (probs.awayWinProb * 100).toFixed(1);
+
+            await callback({
+                text: `🎯 **ChanceDB Snapshot**\n${probs.homeTeam} vs ${probs.awayTeam}\neventKey: ${probs.eventKey}\n\nHome: ${home}%\nDraw: ${draw}%\nAway: ${away}%\n\nUpdated: ${new Date(probs.asOf).toLocaleString()}`,
+                actions: ['GET_PROBABILITY_BY_EVENTKEY'],
+            });
+            return { success: true };
+        } catch (error) {
+            await callback({
+                text: `Couldn't fetch that eventKey yet: ${error instanceof Error ? error.message : 'Unknown error'}`,
+                actions: ['GET_PROBABILITY_BY_EVENTKEY'],
+            });
+            return { success: false };
+        }
+    },
+    examples: [],
+};
+
 // --- WATCHLIST ACTIONS (Telegram/Farcaster friendly) ---
 
 const watchlist = new Map<string, { eventKey: string; thresholdPct?: number; direction: 'up' | 'down' | 'any' }>();
@@ -729,7 +753,7 @@ const watchMatchAction: Action = {
     validate: async () => true,
     handler: async (_runtime, message, _state, _options, callback) => {
         const text = message.content.text || '';
-        const keyMatch = text.match(/eventKey\s*[:=]?\s*([a-zA-Z0-9_:\-.]+)/i) || text.match(/\b(ev_[a-zA-Z0-9_:\-.]+)\b/i);
+        const eventKey = extractEventKey(text);
         const thresholdMatch = text.match(/(\d{1,2}(?:\.\d+)?)\s?%/);
         const direction: 'up' | 'down' | 'any' = /\bdown|drop|below\b/i.test(text)
             ? 'down'
@@ -737,15 +761,13 @@ const watchMatchAction: Action = {
             ? 'up'
             : 'any';
 
-        if (!keyMatch?.[1]) {
+        if (!eventKey) {
             await callback({
                 text: 'Use: watch eventKey <EVENT_KEY> [threshold %]. Example: watch eventKey ev_arsenal_spurs_1x2 5%',
                 actions: ['WATCH_MATCH'],
             });
             return { success: false };
         }
-
-        const eventKey = keyMatch[1];
         const thresholdPct = thresholdMatch ? Number(thresholdMatch[1]) : undefined;
         watchlist.set(eventKey, { eventKey, thresholdPct, direction });
 
@@ -765,15 +787,15 @@ const unwatchMatchAction: Action = {
     validate: async () => true,
     handler: async (_runtime, message, _state, _options, callback) => {
         const text = message.content.text || '';
-        const keyMatch = text.match(/eventKey\s*[:=]?\s*([a-zA-Z0-9_:\-.]+)/i) || text.match(/\b(ev_[a-zA-Z0-9_:\-.]+)\b/i);
-        if (!keyMatch?.[1]) {
+        const eventKey = extractEventKey(text);
+        if (!eventKey) {
             await callback({ text: 'Tell me which eventKey to unwatch.', actions: ['UNWATCH_MATCH'] });
             return { success: false };
         }
 
-        const removed = watchlist.delete(keyMatch[1]);
+        const removed = watchlist.delete(eventKey);
         await callback({
-            text: removed ? `🛑 Stopped watching ${keyMatch[1]}.` : `I wasn't watching ${keyMatch[1]}.`,
+            text: removed ? `🛑 Stopped watching ${eventKey}.` : `I wasn't watching ${eventKey}.`,
             actions: ['UNWATCH_MATCH'],
         });
         return { success: true };
@@ -803,7 +825,7 @@ const listWatchesAction: Action = {
 
 export const footyPlugin: Plugin = {
     name: 'footy',
-    description: 'Football data, predictions with real market odds, live scores, standings, and fantasy advice.',
+    description: 'ChanceDB-first conversational probability agent for sports events, with football utilities and social integrations.',
     actions: [
         getFixturesAction,
         getBettingMarketsAction,  // NEW: BWAPs integration
@@ -812,6 +834,7 @@ export const footyPlugin: Plugin = {
         getFantasyAdviceAction,
         getLiveScoresAction,
         getStandingsAction,
+        getProbabilityByEventKeyAction,
         watchMatchAction,
         unwatchMatchAction,
         listWatchesAction,
