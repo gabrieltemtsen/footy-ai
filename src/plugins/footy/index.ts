@@ -22,26 +22,34 @@ const extractEventKey = (text: string): string | null => {
     return match?.[1] || null;
 };
 
-const findLeaseFromText = (leases: BwapsLease[], text: string): BwapsLease | null => {
+const findLeaseCandidatesFromText = (leases: BwapsLease[], text: string): BwapsLease[] => {
     const content = text.toLowerCase();
 
     const byEventKey = extractEventKey(text);
     if (byEventKey) {
         const lease = leases.find((l) => l.eventKey === byEventKey || l.leaseId === byEventKey);
-        if (lease) return lease;
+        return lease ? [lease] : [];
     }
 
-    for (const lease of leases) {
-        const homeWords = lease.homeTeam.toLowerCase().split(' ');
-        const awayWords = lease.awayTeam.toLowerCase().split(' ');
+    const scored = leases
+        .map((lease) => {
+            const homeWords = lease.homeTeam.toLowerCase().split(' ');
+            const awayWords = lease.awayTeam.toLowerCase().split(' ');
+            const homeMatchCount = homeWords.filter((word) => word.length > 2 && content.includes(word)).length;
+            const awayMatchCount = awayWords.filter((word) => word.length > 2 && content.includes(word)).length;
+            const score = homeMatchCount + awayMatchCount + (homeMatchCount > 0 && awayMatchCount > 0 ? 3 : 0);
+            return { lease, score };
+        })
+        .filter((x) => x.score > 0)
+        .sort((a, b) => b.score - a.score)
+        .map((x) => x.lease);
 
-        const homeMatch = homeWords.some((word) => word.length > 3 && content.includes(word));
-        const awayMatch = awayWords.some((word) => word.length > 3 && content.includes(word));
+    return scored;
+};
 
-        if (homeMatch && awayMatch) return lease;
-    }
-
-    return null;
+const findLeaseFromText = (leases: BwapsLease[], text: string): BwapsLease | null => {
+    const candidates = findLeaseCandidatesFromText(leases, text);
+    return candidates[0] || null;
 };
 
 // --- PROVIDER ---
@@ -202,11 +210,10 @@ const getBettingMarketsAction: Action = {
 
                 responseText += `⚽ **${lease.homeTeam}** vs **${lease.awayTeam}**\n`;
                 responseText += `   📅 ${dateStr}\n`;
-                responseText += `   🆔 eventKey: ${lease.eventKey || lease.leaseId}\n`;
                 responseText += `   🔗 Sources: ${lease.sourceUrls.length} prediction markets\n\n`;
             }
 
-            responseText += "\n💡 *Ask for probabilities by matchup or eventKey, e.g. 'probability Tottenham vs West Ham' or 'probability eventKey ev_xxx'.*";
+            responseText += "\n💡 *Ask naturally, e.g. 'probability Tottenham vs West Ham' or 'who is favored in Madrid vs Barca?'.*";
 
             const response: Content = {
                 text: responseText,
@@ -270,10 +277,10 @@ const getMatchOddsAction: Action = {
             }
 
             // Find by explicit eventKey or by matchup text
-            const matchingLease = findLeaseFromText(leases.leases, message.content.text || '');
+            const candidates = findLeaseCandidatesFromText(leases.leases, message.content.text || '');
+            const matchingLease = candidates[0] || null;
 
             if (!matchingLease) {
-                // If no match found, show available markets
                 const availableMatches = leases.leases
                     .filter(l => !l.isPast)
                     .slice(0, 5)
@@ -281,10 +288,19 @@ const getMatchOddsAction: Action = {
                     .join('\n');
 
                 const response: Content = {
-                    text: `I couldn't match that event yet. Try: \n• probability <team A> vs <team B>\n• probability eventKey <EVENT_KEY>\n\nAvailable examples:\n${availableMatches}`,
+                    text: `I couldn't find that matchup yet. Try a natural prompt like:\n• odds Arsenal vs Chelsea\n• who is favored in Madrid vs Barca\n\nAvailable right now:\n${availableMatches}`,
                     actions: ['GET_MATCH_ODDS'],
                 };
                 await callback(response);
+                return { success: true };
+            }
+
+            if (candidates.length > 1) {
+                const options = candidates.slice(0, 3).map((l) => `• ${l.homeTeam} vs ${l.awayTeam}`).join('\n');
+                await callback({
+                    text: `I found multiple close matches. Did you mean:\n${options}\n\nReply with the exact matchup and I’ll fetch the probabilities.`,
+                    actions: ['GET_MATCH_ODDS'],
+                });
                 return { success: true };
             }
 
@@ -303,8 +319,7 @@ const getMatchOddsAction: Action = {
             };
 
             let responseText = `🎯 **ChanceDB Probability Snapshot**\n\n`;
-            responseText += `**${probs.homeTeam}** vs **${probs.awayTeam}**\n`;
-            responseText += `eventKey: ${probs.eventKey}\n\n`;
+            responseText += `**${probs.homeTeam}** vs **${probs.awayTeam}**\n\n`;
             responseText += `| Outcome | Probability |\n`;
             responseText += `|---------|-------------|\n`;
             responseText += `| 🏠 Home Win | ${createBar(probs.homeWinProb)} **${homePercent}%** |\n`;
@@ -381,9 +396,10 @@ const predictMatchAction: Action = {
         try {
             // First, try to get BWAPs data for this match
             const leases = await bwapsApiService.getActiveLeases();
-            const matchingLease = findLeaseFromText(leases.leases, message.content.text || '');
+            const candidates = findLeaseCandidatesFromText(leases.leases, message.content.text || '');
+            const matchingLease = candidates[0] || null;
 
-            if (matchingLease) {
+            if (matchingLease && candidates.length === 1) {
                 // We have BWAPs data - use real probabilities
                 const probs = await bwapsApiService.getMatchProbabilities(matchingLease.eventKey || matchingLease.leaseId);
 
@@ -433,9 +449,18 @@ const predictMatchAction: Action = {
                 return { success: true };
             }
 
+            if (candidates.length > 1) {
+                const options = candidates.slice(0, 3).map((l) => `• ${l.homeTeam} vs ${l.awayTeam}`).join('\n');
+                await callback({
+                    text: `I found multiple possible matches. Which one did you mean?\n${options}`,
+                    actions: ['PREDICT_MATCH'],
+                });
+                return { success: true };
+            }
+
             // No BWAPs data available - fall back to general response
             const response: Content = {
-                text: "I don't have prediction market data for that match. Try asking about matches from the active betting markets!\n\nSay 'show betting markets' to see available matches with odds.",
+                text: "I couldn't find that matchup in current ChanceDB markets. Try 'show betting markets' first, then ask with exact team names.",
                 actions: ['PREDICT_MATCH'],
             };
 
@@ -746,7 +771,7 @@ const getProbabilityByEventKeyAction: Action = {
 // --- WATCHLIST ACTIONS (Telegram/Farcaster friendly) ---
 
 const WATCH_POLL_INTERVAL_MS = Number(process.env.WATCH_POLL_INTERVAL_MS || 120000);
-const watchlist = new Map<string, { eventKey: string; thresholdPct?: number; direction: 'up' | 'down' | 'any' }>();
+const watchlist = new Map<string, { eventKey: string; label: string; thresholdPct?: number; direction: 'up' | 'down' | 'any' }>();
 const lastHomeProbByEventKey = new Map<string, number>();
 const pendingWatchAlerts: string[] = [];
 let watchPollerStarted = false;
@@ -763,7 +788,7 @@ const maybeQueueAlert = (eventKey: string, homeTeam: string, awayTeam: string, p
 
     if (directionPass && absDelta >= threshold) {
         pendingWatchAlerts.push(
-            `📈 ${homeTeam} vs ${awayTeam} (${eventKey}) moved ${deltaPctPoints > 0 ? '+' : ''}${deltaPctPoints.toFixed(2)}pp (home win ${
+            `📈 ${homeTeam} vs ${awayTeam} moved ${deltaPctPoints > 0 ? '+' : ''}${deltaPctPoints.toFixed(2)}pp (home win ${
                 (prev * 100).toFixed(1)
             }% → ${(next * 100).toFixed(1)}%)`
         );
@@ -842,7 +867,6 @@ const watchMatchAction: Action = {
     validate: async () => true,
     handler: async (_runtime, message, _state, _options, callback) => {
         const text = message.content.text || '';
-        const eventKey = extractEventKey(text);
         const thresholdMatch = text.match(/(\d{1,2}(?:\.\d+)?)\s?%/);
         const direction: 'up' | 'down' | 'any' = /\bdown|drop|below\b/i.test(text)
             ? 'down'
@@ -850,15 +874,31 @@ const watchMatchAction: Action = {
             ? 'up'
             : 'any';
 
-        if (!eventKey) {
+        const leases = await bwapsApiService.getActiveLeases();
+        const candidates = findLeaseCandidatesFromText(leases.leases, text);
+
+        if (candidates.length === 0) {
             await callback({
-                text: 'Use: watch eventKey <EVENT_KEY> [threshold %]. Example: watch eventKey ev_arsenal_spurs_1x2 5%',
+                text: 'I couldn’t find that matchup to watch yet. Try: "track Arsenal vs Chelsea" or "watch Madrid vs Barca".',
                 actions: ['WATCH_MATCH'],
             });
             return { success: false };
         }
+
+        if (candidates.length > 1) {
+            const options = candidates.slice(0, 3).map((l) => `• ${l.homeTeam} vs ${l.awayTeam}`).join('\n');
+            await callback({
+                text: `I found multiple matches. Which one should I watch?\n${options}`,
+                actions: ['WATCH_MATCH'],
+            });
+            return { success: true };
+        }
+
+        const selected = candidates[0];
+        const eventKey = selected.eventKey || selected.leaseId;
+        const label = `${selected.homeTeam} vs ${selected.awayTeam}`;
         const thresholdPct = thresholdMatch ? Number(thresholdMatch[1]) : undefined;
-        watchlist.set(eventKey, { eventKey, thresholdPct, direction });
+        watchlist.set(eventKey, { eventKey, label, thresholdPct, direction });
 
         try {
             const probs = await bwapsApiService.getMatchProbabilities(eventKey);
@@ -868,7 +908,7 @@ const watchMatchAction: Action = {
         }
 
         await callback({
-            text: `✅ Watching ${eventKey}${thresholdPct ? ` (threshold ${thresholdPct}%)` : ''}. I'll track movement and surface updates in chat.`,
+            text: `✅ Watching ${label}${thresholdPct ? ` (${direction} ${thresholdPct}%)` : ''}. I’ll alert you when probabilities move.`,
             actions: ['WATCH_MATCH'],
         });
         return { success: true };
@@ -882,17 +922,33 @@ const unwatchMatchAction: Action = {
     description: 'Stop watching a ChanceDB eventKey.',
     validate: async () => true,
     handler: async (_runtime, message, _state, _options, callback) => {
-        const text = message.content.text || '';
-        const eventKey = extractEventKey(text);
-        if (!eventKey) {
-            await callback({ text: 'Tell me which eventKey to unwatch.', actions: ['UNWATCH_MATCH'] });
+        const text = (message.content.text || '').toLowerCase();
+
+        let keyToRemove: string | null = null;
+
+        const explicitKey = extractEventKey(text);
+        if (explicitKey && watchlist.has(explicitKey)) {
+            keyToRemove = explicitKey;
+        } else {
+            for (const [key, watch] of watchlist.entries()) {
+                if (text.includes(watch.label.toLowerCase()) || watch.label.toLowerCase().split(' vs ').every((part) => text.includes(part.trim()))) {
+                    keyToRemove = key;
+                    break;
+                }
+            }
+        }
+
+        if (!keyToRemove) {
+            await callback({ text: 'Tell me the matchup to stop tracking, e.g. "unwatch Arsenal vs Chelsea".', actions: ['UNWATCH_MATCH'] });
             return { success: false };
         }
 
-        const removed = watchlist.delete(eventKey);
-        lastHomeProbByEventKey.delete(eventKey);
+        const watch = watchlist.get(keyToRemove);
+        watchlist.delete(keyToRemove);
+        lastHomeProbByEventKey.delete(keyToRemove);
+
         await callback({
-            text: removed ? `🛑 Stopped watching ${eventKey}.` : `I wasn't watching ${eventKey}.`,
+            text: `🛑 Stopped watching ${watch?.label || 'that match'}.`,
             actions: ['UNWATCH_MATCH'],
         });
         return { success: true };
@@ -907,11 +963,11 @@ const listWatchesAction: Action = {
     validate: async () => true,
     handler: async (_runtime, _message, _state, _options, callback) => {
         if (watchlist.size === 0) {
-            await callback({ text: 'No active watches yet. Add one with: watch eventKey <EVENT_KEY> 5%', actions: ['LIST_WATCHES'] });
+            await callback({ text: 'No active watches yet. Try: "track Arsenal vs Chelsea" or "watch Barca vs Madrid 5%".', actions: ['LIST_WATCHES'] });
             return { success: true };
         }
 
-        const lines = [...watchlist.values()].map((w) => `• ${w.eventKey}${w.thresholdPct ? ` | ${w.direction} ${w.thresholdPct}%` : ''}`);
+        const lines = [...watchlist.values()].map((w) => `• ${w.label}${w.thresholdPct ? ` | ${w.direction} ${w.thresholdPct}%` : ''}`);
         let text = `📌 Active watches:\n${lines.join('\n')}`;
 
         if (pendingWatchAlerts.length > 0) {
