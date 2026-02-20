@@ -12,10 +12,49 @@ import {
     Service,
 } from '@elizaos/core';
 import { FootballApiService, leagues, type Fixture, type LiveMatch, type StandingsEntry } from './services/football-api.ts';
-import { bwapsApiService, type BwapsLease } from './services/bwaps-api.ts';
+import { bwapsApiService, type BwapsLease, type DiscoverRequest } from './services/bwaps-api.ts';
+import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { dirname } from 'node:path';
 
 // --- SERVICE INSTANCES ---
 const apiService = new FootballApiService();
+
+const DISCOVERY_CACHE_FILE = process.env.CHANCEDB_DISCOVERY_CACHE_FILE || '.eliza/chancedb-discoveries.json';
+const DISCOVERY_REFRESH_MS = Number(process.env.DISCOVERY_REFRESH_MS || 86400000);
+const DISCOVERY_MARKET_TYPE = process.env.DISCOVERY_MARKET_TYPE || 'SOCCER_1X2';
+const DISCOVERY_TARGET_VARIABLE_KEY = process.env.DISCOVERY_TARGET_VARIABLE_KEY || 'SOCCER_1X2_TERMINAL_WINNER';
+
+type DiscoveredPair = {
+    polymarketUrl: string;
+    kalshiUrl: string;
+    leaseId?: string;
+    eventKey?: string;
+    label?: string;
+    discoveredAt: string;
+};
+
+let discoveredPairs: DiscoveredPair[] = [];
+
+const loadDiscoveredPairs = async () => {
+    try {
+        const raw = await readFile(DISCOVERY_CACHE_FILE, 'utf8');
+        discoveredPairs = JSON.parse(raw) as DiscoveredPair[];
+    } catch {
+        discoveredPairs = [];
+    }
+};
+
+const saveDiscoveredPairs = async () => {
+    await mkdir(dirname(DISCOVERY_CACHE_FILE), { recursive: true });
+    await writeFile(DISCOVERY_CACHE_FILE, JSON.stringify(discoveredPairs, null, 2), 'utf8');
+};
+
+const upsertDiscoveredPair = async (pair: DiscoveredPair) => {
+    const idx = discoveredPairs.findIndex((p) => p.polymarketUrl === pair.polymarketUrl && p.kalshiUrl === pair.kalshiUrl);
+    if (idx >= 0) discoveredPairs[idx] = pair;
+    else discoveredPairs.push(pair);
+    await saveDiscoveredPairs();
+};
 
 const extractEventKey = (text: string): string | null => {
     const match = text.match(/eventKey\s*[:=]?\s*([a-zA-Z0-9_:\-.]+)/i) || text.match(/\b(ev_[a-zA-Z0-9_:\-.]+)\b/i);
@@ -729,6 +768,98 @@ const getStandingsAction: Action = {
     ],
 };
 
+const discoverFromUrls = async (polymarketUrl: string, kalshiUrl: string): Promise<DiscoveredPair> => {
+    const req: DiscoverRequest = {
+        marketType: DISCOVERY_MARKET_TYPE,
+        sources: {
+            polymarket: { url: polymarketUrl },
+            kalshi: { url: kalshiUrl },
+        },
+        options: {
+            includeLease: true,
+            targetVariableKey: DISCOVERY_TARGET_VARIABLE_KEY,
+        },
+    };
+
+    const result = await bwapsApiService.discoverEvent(req);
+    const home = result.readyToIngest?.canonicalEvent?.homeTeam?.name;
+    const away = result.readyToIngest?.canonicalEvent?.awayTeam?.name;
+
+    const pair: DiscoveredPair = {
+        polymarketUrl,
+        kalshiUrl,
+        leaseId: result.readyToIngest?.leaseId,
+        eventKey: result.readyToIngest?.eventKey,
+        label: home && away ? `${home} vs ${away}` : undefined,
+        discoveredAt: new Date().toISOString(),
+    };
+
+    await upsertDiscoveredPair(pair);
+    return pair;
+};
+
+const loadSeedPairsFromEnv = (): Array<{ polymarketUrl: string; kalshiUrl: string }> => {
+    try {
+        const raw = process.env.CHANCEDB_DISCOVERY_SEEDS_JSON;
+        if (!raw) return [];
+        const parsed = JSON.parse(raw) as Array<{ polymarketUrl: string; kalshiUrl: string }>;
+        return parsed.filter((x) => x?.polymarketUrl && x?.kalshiUrl);
+    } catch {
+        return [];
+    }
+};
+
+const refreshSeedDiscoveries = async () => {
+    const seeds = loadSeedPairsFromEnv();
+    if (seeds.length === 0) return;
+
+    for (const seed of seeds) {
+        try {
+            await discoverFromUrls(seed.polymarketUrl, seed.kalshiUrl);
+        } catch (error) {
+            logger.warn(`Seed discovery failed for ${seed.polymarketUrl}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
+    }
+};
+
+const discoverEventAction: Action = {
+    name: 'DISCOVER_EVENT',
+    similes: ['DISCOVER_MARKET', 'PAIR_MARKETS', 'ADD_EVENT_SOURCE'],
+    description: 'Creates/reuses a ChanceDB canonical event by pairing Polymarket and Kalshi URLs.',
+    validate: async () => true,
+    handler: async (_runtime, message, _state, _options, callback) => {
+        const text = message.content.text || '';
+        const urls = text.match(/https?:\/\/[^\s]+/g) || [];
+        const polymarketUrl = urls.find((u) => u.includes('polymarket.com/event'));
+        const kalshiUrl = urls.find((u) => u.includes('kalshi.com/markets'));
+
+        if (!polymarketUrl || !kalshiUrl) {
+            await callback({
+                text: 'To add a reusable event pair, send both links in one message:\n• Polymarket event URL\n• Kalshi market URL',
+                actions: ['DISCOVER_EVENT'],
+            });
+            return { success: false };
+        }
+
+        try {
+            const pair = await discoverFromUrls(polymarketUrl, kalshiUrl);
+            const label = pair.label || 'Event paired';
+            await callback({
+                text: `✅ ${label} is now loaded and reusable. ${pair.eventKey ? 'You can query probabilities immediately.' : 'Lease created; it should be queryable shortly.'}`,
+                actions: ['DISCOVER_EVENT'],
+            });
+            return { success: true };
+        } catch (error) {
+            await callback({
+                text: `Could not pair these sources yet: ${error instanceof Error ? error.message : 'Unknown error'}`,
+                actions: ['DISCOVER_EVENT'],
+            });
+            return { success: false };
+        }
+    },
+    examples: [],
+};
+
 const getProbabilityByEventKeyAction: Action = {
     name: 'GET_PROBABILITY_BY_EVENTKEY',
     similes: ['PROBABILITY_BY_EVENTKEY', 'SNAPSHOT_BY_EVENTKEY', 'EVENTKEY_ODDS'],
@@ -824,8 +955,9 @@ const pollWatchedEvents = async () => {
 
 class FootyWatchService extends Service {
     static serviceType = 'footy-watch';
-    capabilityDescription = 'Polls watched ChanceDB eventKeys and queues probability movement alerts.';
-    private timer: ReturnType<typeof setInterval> | null = null;
+    capabilityDescription = 'Polls watched ChanceDB eventKeys, refreshes discovered source pairs, and queues probability alerts.';
+    private watchTimer: ReturnType<typeof setInterval> | null = null;
+    private discoverTimer: ReturnType<typeof setInterval> | null = null;
 
     constructor(runtime: IAgentRuntime) {
         super(runtime);
@@ -833,6 +965,8 @@ class FootyWatchService extends Service {
 
     static async start(runtime: IAgentRuntime) {
         const service = new FootyWatchService(runtime);
+        await loadDiscoveredPairs();
+        await refreshSeedDiscoveries();
         service.startLoop();
         return service;
     }
@@ -843,18 +977,28 @@ class FootyWatchService extends Service {
     }
 
     private startLoop() {
-        if (this.timer) return;
-        this.timer = setInterval(() => {
+        if (this.watchTimer || this.discoverTimer) return;
+
+        this.watchTimer = setInterval(() => {
             void pollWatchedEvents();
         }, WATCH_POLL_INTERVAL_MS);
+
+        this.discoverTimer = setInterval(() => {
+            void refreshSeedDiscoveries();
+        }, DISCOVERY_REFRESH_MS);
+
         watchPollerStarted = true;
-        logger.info(`Footy watch poller started (${WATCH_POLL_INTERVAL_MS}ms)`);
+        logger.info(`Footy watch poller started (${WATCH_POLL_INTERVAL_MS}ms), seed discover refresh (${DISCOVERY_REFRESH_MS}ms)`);
     }
 
     async stop() {
-        if (this.timer) {
-            clearInterval(this.timer);
-            this.timer = null;
+        if (this.watchTimer) {
+            clearInterval(this.watchTimer);
+            this.watchTimer = null;
+        }
+        if (this.discoverTimer) {
+            clearInterval(this.discoverTimer);
+            this.discoverTimer = null;
         }
         watchPollerStarted = false;
     }
@@ -976,6 +1120,7 @@ const listWatchesAction: Action = {
         }
 
         text += `\n\nPoller: ${watchPollerStarted ? 'running' : 'starting...'} (every ${Math.round(WATCH_POLL_INTERVAL_MS / 1000)}s)`;
+        text += `\nDiscovered source pairs cached: ${discoveredPairs.length}`;
 
         await callback({ text, actions: ['LIST_WATCHES'] });
         return { success: true };
@@ -996,6 +1141,7 @@ export const footyPlugin: Plugin = {
         getFantasyAdviceAction,
         getLiveScoresAction,
         getStandingsAction,
+        discoverEventAction,
         getProbabilityByEventKeyAction,
         watchMatchAction,
         unwatchMatchAction,
