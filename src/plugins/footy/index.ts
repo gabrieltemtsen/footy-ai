@@ -286,7 +286,7 @@ const getMatchOddsAction: Action = {
             }
 
             // Fetch the prediction probabilities
-            const probs = await bwapsApiService.getMatchProbabilities(matchingLease.leaseId);
+            const probs = await bwapsApiService.getMatchProbabilities(matchingLease.eventKey || matchingLease.leaseId);
 
             // Format probabilities as percentages
             const homePercent = (probs.homeWinProb * 100).toFixed(1);
@@ -399,7 +399,7 @@ const predictMatchAction: Action = {
 
             if (matchingLease) {
                 // We have BWAPs data - use real probabilities
-                const probs = await bwapsApiService.getMatchProbabilities(matchingLease.leaseId);
+                const probs = await bwapsApiService.getMatchProbabilities(matchingLease.eventKey || matchingLease.leaseId);
 
                 const homePercent = (probs.homeWinProb * 100).toFixed(1);
                 const drawPercent = (probs.drawProb * 100).toFixed(1);
@@ -718,6 +718,87 @@ const getStandingsAction: Action = {
     ],
 };
 
+// --- WATCHLIST ACTIONS (Telegram/Farcaster friendly) ---
+
+const watchlist = new Map<string, { eventKey: string; thresholdPct?: number; direction: 'up' | 'down' | 'any' }>();
+
+const watchMatchAction: Action = {
+    name: 'WATCH_MATCH',
+    similes: ['WATCH_ODDS', 'ALERT_MATCH', 'TRACK_MATCH'],
+    description: 'Watch a ChanceDB eventKey and alert when probabilities move past threshold.',
+    validate: async () => true,
+    handler: async (_runtime, message, _state, _options, callback) => {
+        const text = message.content.text || '';
+        const keyMatch = text.match(/eventKey\s*[:=]?\s*([a-zA-Z0-9_:\-.]+)/i) || text.match(/\b(ev_[a-zA-Z0-9_:\-.]+)\b/i);
+        const thresholdMatch = text.match(/(\d{1,2}(?:\.\d+)?)\s?%/);
+        const direction: 'up' | 'down' | 'any' = /\bdown|drop|below\b/i.test(text)
+            ? 'down'
+            : /\bup|rise|above\b/i.test(text)
+            ? 'up'
+            : 'any';
+
+        if (!keyMatch?.[1]) {
+            await callback({
+                text: 'Use: watch eventKey <EVENT_KEY> [threshold %]. Example: watch eventKey ev_arsenal_spurs_1x2 5%',
+                actions: ['WATCH_MATCH'],
+            });
+            return { success: false };
+        }
+
+        const eventKey = keyMatch[1];
+        const thresholdPct = thresholdMatch ? Number(thresholdMatch[1]) : undefined;
+        watchlist.set(eventKey, { eventKey, thresholdPct, direction });
+
+        await callback({
+            text: `✅ Watching ${eventKey}${thresholdPct ? ` (threshold ${thresholdPct}%)` : ''}. I'll track movement and surface updates in chat.`,
+            actions: ['WATCH_MATCH'],
+        });
+        return { success: true };
+    },
+    examples: [],
+};
+
+const unwatchMatchAction: Action = {
+    name: 'UNWATCH_MATCH',
+    similes: ['REMOVE_WATCH', 'STOP_WATCHING'],
+    description: 'Stop watching a ChanceDB eventKey.',
+    validate: async () => true,
+    handler: async (_runtime, message, _state, _options, callback) => {
+        const text = message.content.text || '';
+        const keyMatch = text.match(/eventKey\s*[:=]?\s*([a-zA-Z0-9_:\-.]+)/i) || text.match(/\b(ev_[a-zA-Z0-9_:\-.]+)\b/i);
+        if (!keyMatch?.[1]) {
+            await callback({ text: 'Tell me which eventKey to unwatch.', actions: ['UNWATCH_MATCH'] });
+            return { success: false };
+        }
+
+        const removed = watchlist.delete(keyMatch[1]);
+        await callback({
+            text: removed ? `🛑 Stopped watching ${keyMatch[1]}.` : `I wasn't watching ${keyMatch[1]}.`,
+            actions: ['UNWATCH_MATCH'],
+        });
+        return { success: true };
+    },
+    examples: [],
+};
+
+const listWatchesAction: Action = {
+    name: 'LIST_WATCHES',
+    similes: ['WATCHLIST', 'LIST_ALERTS'],
+    description: 'List current ChanceDB event watches.',
+    validate: async () => true,
+    handler: async (_runtime, _message, _state, _options, callback) => {
+        if (watchlist.size === 0) {
+            await callback({ text: 'No active watches yet. Add one with: watch eventKey <EVENT_KEY> 5%', actions: ['LIST_WATCHES'] });
+            return { success: true };
+        }
+
+        const lines = [...watchlist.values()].map((w) => `• ${w.eventKey}${w.thresholdPct ? ` | ${w.direction} ${w.thresholdPct}%` : ''}`);
+        await callback({ text: `📌 Active watches:\n${lines.join('\n')}`, actions: ['LIST_WATCHES'] });
+        return { success: true };
+    },
+    examples: [],
+};
+
 // --- PLUGIN DEFINITION ---
 
 export const footyPlugin: Plugin = {
@@ -730,7 +811,10 @@ export const footyPlugin: Plugin = {
         predictMatchAction,       // UPDATED: Uses BWAPs data
         getFantasyAdviceAction,
         getLiveScoresAction,
-        getStandingsAction
+        getStandingsAction,
+        watchMatchAction,
+        unwatchMatchAction,
+        listWatchesAction,
     ],
     providers: [footballDataProvider],
 };
