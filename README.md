@@ -4,13 +4,13 @@ Telegram-first football agent with optional Farcaster integration, powered by El
 
 ## What it does
 
-- Live football utility: fixtures, standings, live scores, fantasy tips
+- Live football utility: fixtures, standings, live scores, fantasy tips (e.g. "who is playing today?", "scores so far")
 - Prediction-market context via ChanceDB (`/bwaps/leases`, `/snapshots/latest`)
 - Match probability answers (home/draw/away)
-- Basic watchlist intents for event-key monitoring:
+- Watchlist + background poller for event-key monitoring:
   - `watch eventKey <EVENT_KEY> 5%`
   - `unwatch eventKey <EVENT_KEY>`
-  - `watchlist`
+  - `watchlist` (also shows queued movement alerts)
 
 ## Integrations
 

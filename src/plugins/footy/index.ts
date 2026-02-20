@@ -9,6 +9,7 @@ import {
     type Provider,
     type State,
     logger,
+    Service,
 } from '@elizaos/core';
 import { FootballApiService, leagues, type Fixture, type LiveMatch, type StandingsEntry } from './services/football-api.ts';
 import { bwapsApiService, type BwapsLease } from './services/bwaps-api.ts';
@@ -744,7 +745,95 @@ const getProbabilityByEventKeyAction: Action = {
 
 // --- WATCHLIST ACTIONS (Telegram/Farcaster friendly) ---
 
+const WATCH_POLL_INTERVAL_MS = Number(process.env.WATCH_POLL_INTERVAL_MS || 120000);
 const watchlist = new Map<string, { eventKey: string; thresholdPct?: number; direction: 'up' | 'down' | 'any' }>();
+const lastHomeProbByEventKey = new Map<string, number>();
+const pendingWatchAlerts: string[] = [];
+let watchPollerStarted = false;
+
+const maybeQueueAlert = (eventKey: string, homeTeam: string, awayTeam: string, prev: number, next: number, thresholdPct?: number, direction: 'up' | 'down' | 'any' = 'any') => {
+    const deltaPctPoints = (next - prev) * 100;
+    const absDelta = Math.abs(deltaPctPoints);
+    const threshold = thresholdPct ?? 3;
+
+    const directionPass =
+        direction === 'any' ||
+        (direction === 'up' && deltaPctPoints > 0) ||
+        (direction === 'down' && deltaPctPoints < 0);
+
+    if (directionPass && absDelta >= threshold) {
+        pendingWatchAlerts.push(
+            `📈 ${homeTeam} vs ${awayTeam} (${eventKey}) moved ${deltaPctPoints > 0 ? '+' : ''}${deltaPctPoints.toFixed(2)}pp (home win ${
+                (prev * 100).toFixed(1)
+            }% → ${(next * 100).toFixed(1)}%)`
+        );
+    }
+};
+
+const pollWatchedEvents = async () => {
+    if (watchlist.size === 0) return;
+
+    for (const watch of watchlist.values()) {
+        try {
+            const probs = await bwapsApiService.getMatchProbabilities(watch.eventKey);
+            const prev = lastHomeProbByEventKey.get(watch.eventKey);
+
+            if (typeof prev === 'number') {
+                maybeQueueAlert(
+                    watch.eventKey,
+                    probs.homeTeam,
+                    probs.awayTeam,
+                    prev,
+                    probs.homeWinProb,
+                    watch.thresholdPct,
+                    watch.direction
+                );
+            }
+
+            lastHomeProbByEventKey.set(watch.eventKey, probs.homeWinProb);
+        } catch (error) {
+            logger.warn(`Watch poll failed for ${watch.eventKey}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
+    }
+};
+
+class FootyWatchService extends Service {
+    static serviceType = 'footy-watch';
+    capabilityDescription = 'Polls watched ChanceDB eventKeys and queues probability movement alerts.';
+    private timer: ReturnType<typeof setInterval> | null = null;
+
+    constructor(runtime: IAgentRuntime) {
+        super(runtime);
+    }
+
+    static async start(runtime: IAgentRuntime) {
+        const service = new FootyWatchService(runtime);
+        service.startLoop();
+        return service;
+    }
+
+    static async stop(runtime: IAgentRuntime) {
+        const service = runtime.getService(FootyWatchService.serviceType) as FootyWatchService | null;
+        service?.stop();
+    }
+
+    private startLoop() {
+        if (this.timer) return;
+        this.timer = setInterval(() => {
+            void pollWatchedEvents();
+        }, WATCH_POLL_INTERVAL_MS);
+        watchPollerStarted = true;
+        logger.info(`Footy watch poller started (${WATCH_POLL_INTERVAL_MS}ms)`);
+    }
+
+    async stop() {
+        if (this.timer) {
+            clearInterval(this.timer);
+            this.timer = null;
+        }
+        watchPollerStarted = false;
+    }
+}
 
 const watchMatchAction: Action = {
     name: 'WATCH_MATCH',
@@ -771,6 +860,13 @@ const watchMatchAction: Action = {
         const thresholdPct = thresholdMatch ? Number(thresholdMatch[1]) : undefined;
         watchlist.set(eventKey, { eventKey, thresholdPct, direction });
 
+        try {
+            const probs = await bwapsApiService.getMatchProbabilities(eventKey);
+            lastHomeProbByEventKey.set(eventKey, probs.homeWinProb);
+        } catch {
+            // ignore baseline fetch errors; poller will retry
+        }
+
         await callback({
             text: `✅ Watching ${eventKey}${thresholdPct ? ` (threshold ${thresholdPct}%)` : ''}. I'll track movement and surface updates in chat.`,
             actions: ['WATCH_MATCH'],
@@ -794,6 +890,7 @@ const unwatchMatchAction: Action = {
         }
 
         const removed = watchlist.delete(eventKey);
+        lastHomeProbByEventKey.delete(eventKey);
         await callback({
             text: removed ? `🛑 Stopped watching ${eventKey}.` : `I wasn't watching ${eventKey}.`,
             actions: ['UNWATCH_MATCH'],
@@ -815,7 +912,16 @@ const listWatchesAction: Action = {
         }
 
         const lines = [...watchlist.values()].map((w) => `• ${w.eventKey}${w.thresholdPct ? ` | ${w.direction} ${w.thresholdPct}%` : ''}`);
-        await callback({ text: `📌 Active watches:\n${lines.join('\n')}`, actions: ['LIST_WATCHES'] });
+        let text = `📌 Active watches:\n${lines.join('\n')}`;
+
+        if (pendingWatchAlerts.length > 0) {
+            const alerts = pendingWatchAlerts.splice(0, 5);
+            text += `\n\n🔔 Recent probability moves:\n${alerts.map((a) => `• ${a}`).join('\n')}`;
+        }
+
+        text += `\n\nPoller: ${watchPollerStarted ? 'running' : 'starting...'} (every ${Math.round(WATCH_POLL_INTERVAL_MS / 1000)}s)`;
+
+        await callback({ text, actions: ['LIST_WATCHES'] });
         return { success: true };
     },
     examples: [],
@@ -840,6 +946,7 @@ export const footyPlugin: Plugin = {
         listWatchesAction,
     ],
     providers: [footballDataProvider],
+    services: [FootyWatchService],
 };
 
 export default footyPlugin;
