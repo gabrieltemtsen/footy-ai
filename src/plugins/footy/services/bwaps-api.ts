@@ -1,7 +1,7 @@
 import { elizaLogger } from '@elizaos/core';
 
 const CHANCEDB_API_BASE_URL = process.env.CHANCEDB_API_BASE_URL || 'https://api.chancedb.com/v1';
-const CHANCEDB_CAPABILITY_JWT = process.env.CHANCEDB_CAPABILITY_JWT || process.env.BWAPS_API_KEY;
+const CHANCEDB_CAPABILITY_TOKEN = process.env.CHANCEDB_CAPABILITY_JWT || process.env.BWAPS_API_KEY;
 const CHANCEDB_X402_PAYMENT = process.env.CHANCEDB_X402_PAYMENT;
 
 export interface BwapsLease {
@@ -37,6 +37,38 @@ export interface SnapshotLatestResponse {
   qualitySignals?: { liquidity?: number; volume?: number; sourceCount?: number };
 }
 
+export interface DiscoverRequest {
+  marketType: string;
+  sources: {
+    polymarket: { url: string };
+    kalshi: { url: string };
+  };
+  options?: {
+    includeLease?: boolean;
+    targetVariableKey?: string;
+  };
+}
+
+export interface DiscoverResponse {
+  readyToIngest?: {
+    leaseId?: string;
+    eventKey?: string;
+    canonicalEvent?: {
+      homeTeam?: { name?: string };
+      awayTeam?: { name?: string };
+      startTime?: string;
+    };
+    sourceRefs?: unknown[];
+  };
+  next?: {
+    method?: string;
+    path?: string;
+    preferred?: string;
+  };
+  assumptions?: string[];
+  warnings?: string[];
+}
+
 export interface X402Challenge {
   error: string;
   x402?: {
@@ -56,8 +88,9 @@ export class BwapsApiService {
   private getHeaders(): HeadersInit {
     const headers: HeadersInit = { 'Content-Type': 'application/json' };
 
-    if (CHANCEDB_CAPABILITY_JWT) {
-      headers['Authorization'] = `Bearer ${CHANCEDB_CAPABILITY_JWT}`;
+    if (CHANCEDB_CAPABILITY_TOKEN) {
+      headers['X-ChanceDB-Capability'] = CHANCEDB_CAPABILITY_TOKEN;
+      headers['Authorization'] = `Bearer ${CHANCEDB_CAPABILITY_TOKEN}`;
     }
 
     if (CHANCEDB_X402_PAYMENT) {
@@ -106,6 +139,13 @@ export class BwapsApiService {
 
   async getActiveLeases(): Promise<BwapsLeasesResponse> {
     return this.fetchApi<BwapsLeasesResponse>('/bwaps/leases');
+  }
+
+  async discoverEvent(request: DiscoverRequest): Promise<DiscoverResponse> {
+    return this.fetchApi<DiscoverResponse>('/sources/discover', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
   }
 
   async getLatestSnapshot(eventKey: string): Promise<SnapshotLatestResponse> {
